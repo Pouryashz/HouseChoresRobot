@@ -43,12 +43,19 @@ from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
 )
 
@@ -195,6 +202,29 @@ def start_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+# Persistent button menu shown under the text box. Tapping a button sends
+# its label as a plain text message, which menu_button_handler below
+# routes to the matching command function. Owner-only buttons are shown
+# to everyone (so people know they exist) but still get the funny
+# refusal if someone who isn't the owner taps them.
+BTN_SCHEDULE = "📅 Weekly Schedule"
+BTN_WHOSETURN = "🧹 Who's Turn?"
+BTN_MYID = "🆔 My ID"
+BTN_NEXTTURN = "⏭ Next Turn"
+BTN_SETGROUP = "📍 Set This Group"
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [BTN_WHOSETURN, BTN_SCHEDULE],
+            [BTN_NEXTTURN, BTN_SETGROUP],
+            [BTN_MYID],
+        ],
+        resize_keyboard=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Text builders (pure functions - no Telegram calls, easy to test/preview)
 # ---------------------------------------------------------------------------
@@ -268,14 +298,32 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Hi! I track whose turn it is to clean the house and take out "
         "the trash each weekend, and I nag until someone on that turn "
         "confirms.\n\n"
-        "Commands:\n"
+        "Use the buttons below, or these commands:\n"
         "/whoseturn - see whose turn it is right now\n"
         "/schedule - see the full weekly rotation\n"
         "/nextturn - manually advance to the next turn (owner only)\n"
         "/setgroup - run this inside your group chat (owner only)\n"
         "/myid - get your Telegram numeric ID",
-        reply_markup=start_keyboard(),
+        reply_markup=main_menu_keyboard(),
     )
+
+
+async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Routes a tap on the persistent button menu to the matching command
+    function. Each function below already just does update.message.reply_text,
+    so it works identically whether it was triggered by /command or by a
+    button tap sending that exact text."""
+    text = update.message.text
+    if text == BTN_WHOSETURN:
+        await whoseturn_command(update, context)
+    elif text == BTN_SCHEDULE:
+        await schedule_command(update, context)
+    elif text == BTN_MYID:
+        await myid_command(update, context)
+    elif text == BTN_NEXTTURN:
+        await nextturn_command(update, context)
+    elif text == BTN_SETGROUP:
+        await setgroup_command(update, context)
 
 
 async def whoseturn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -410,6 +458,12 @@ def main():
     app.add_handler(CallbackQueryHandler(ack_button_handler, pattern=f"^{ACK_CALLBACK}$"))
     app.add_handler(
         CallbackQueryHandler(schedule_button_handler, pattern=f"^{SCHEDULE_CALLBACK}$")
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.Text([BTN_WHOSETURN, BTN_SCHEDULE, BTN_MYID, BTN_NEXTTURN, BTN_SETGROUP]),
+            menu_button_handler,
+        )
     )
 
     for cfg, job in ((REMINDER_1, reminder_1), (REMINDER_2, reminder_2), (REMINDER_3, reminder_3)):
