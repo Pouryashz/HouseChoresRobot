@@ -210,6 +210,7 @@ def start_keyboard() -> InlineKeyboardMarkup:
 # Registered with Telegram on startup (see post_init below) so they show
 # up in the native "/" command menu, each with its own description.
 BOT_COMMANDS = [
+    BotCommand("start", "Start the bot"),
     BotCommand("whoseturn", "See whose turn it is right now"),
     BotCommand("schedule", "See the full weekly rotation"),
     BotCommand("nextturn", "Advance to the next turn (owner only)"),
@@ -409,12 +410,21 @@ async def reminder_3(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application) -> None:
     """Runs once after the bot connects, before polling starts. Registers
-    the command list so it shows up in Telegram's native '/' menu. Set
-    explicitly for both private chats and groups, since the default scope
-    doesn't always reliably cover both on every client."""
-    await application.bot.set_my_commands(BOT_COMMANDS)
-    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
-    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+    the command list so it shows up in Telegram's native '/' menu, for
+    private chats and group chats specifically."""
+    await application.bot.set_my_commands(
+        BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats()
+    )
+    await application.bot.set_my_commands(
+        BOT_COMMANDS, scope=BotCommandScopeAllGroupChats()
+    )
+
+    # Ask Telegram what it actually has on file, so the logs confirm
+    # registration succeeded rather than just trusting the call didn't error.
+    group_cmds = await application.bot.get_my_commands(scope=BotCommandScopeAllGroupChats())
+    private_cmds = await application.bot.get_my_commands(scope=BotCommandScopeAllPrivateChats())
+    logger.info("Registered GROUP commands: %s", group_cmds)
+    logger.info("Registered PRIVATE commands: %s", private_cmds)
 
 
 def main():
