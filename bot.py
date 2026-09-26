@@ -4,23 +4,6 @@ House Cleaning Bot
 
 Rotates through a list of turns and reminds the group whose turn it is
 to clean the house / take out the trash each weekend.
-
-Reminder flow:
-    1. Friday evening   - first reminder + accept button
-    2. Saturday morning - second reminder if nobody accepted
-    3. Saturday afternoon - final funny warning if nobody accepted
-
-Commands:
-    /start
-    /whoseturn
-    /schedule
-    /nextturn
-    /setgroup
-    /review
-
-Owner-only:
-    /nextturn
-    /setgroup
 """
 
 import json
@@ -126,6 +109,14 @@ DENIED_MESSAGES = [
     "Access denied. Please direct all complaints to management (Pourya).",
     "I only take orders from my one true boss. You are not him.",
     "Sorry, that command requires a level of authority you simply do not have.",
+]
+
+POLL_OPTIONS = [
+    "Poor 🤢", 
+    "Mehhh! 😒", 
+    "Acceptable 😐", 
+    "Good 🙂", 
+    "Perfect ✨"
 ]
 
 # ---------------------------------------------------------------------------
@@ -235,8 +226,8 @@ BOT_COMMANDS = [
     BotCommand("start", "Start the bot"),
     BotCommand("whoseturn", "See whose turn it is right now"),
     BotCommand("schedule", "See the full weekly rotation"),
-    BotCommand("review", "Leave an anonymous comment (DM only)"),
     BotCommand("nextturn", "Advance to the next turn (owner only)"),
+    BotCommand("restart", "Restart rotation to Week 1 (owner only)"),
     BotCommand("setgroup", "Set this chat for reminders (owner only)"),
 ]
 
@@ -249,9 +240,6 @@ def build_whoseturn_text(state: dict) -> str:
     return f"This weekend it's {names_only(current_turn(state))}'s turn ({status})."
 
 def build_schedule_text(state: dict) -> str:
-    """
-    Manually set schedule text.
-    """
     return (
         "📅 <b>Weekly Cleaning Schedule</b>\n\n"
         "🔹 <b>Week 1:</b> Danial & Pourya\n"
@@ -282,23 +270,11 @@ async def register_commands_for_chat(bot, chat_id: int) -> list:
 
 async def post_init(application: Application) -> None:
     logger.info("Registering Telegram bot commands...")
-
-    # The universal fallback to prevent empty menus
-    await application.bot.set_my_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeDefault(),
-    )
     
-    await application.bot.set_my_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeAllPrivateChats(),
-    )
+    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
     
-    await application.bot.set_my_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeAllGroupChats(),
-    )
-
     logger.info("Global Telegram command registration complete.")
 
 # ---------------------------------------------------------------------------
@@ -307,8 +283,14 @@ async def post_init(application: Application) -> None:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hi! I track whose turn it is to clean the house and take out the trash each weekend.\n\n"
-        "Type / to see my commands, or tap the button below for the schedule.",
+        "Hi! I track whose turn it is to clean the house and take out the trash each weekend, and I nag until the person on duty accepts the job! 🧹\n\n"
+        "Here is what I can do:\n"
+        "/whoseturn - See whose turn it is right now\n"
+        "/schedule - See the full weekly rotation\n\n"
+        "Admin commands:\n"
+        "/nextturn - Advance to the next turn\n"
+        "/restart - Reset the schedule back to Week 1\n"
+        "/setgroup - Set this chat for reminders",
         reply_markup=start_keyboard(),
     )
 
@@ -341,6 +323,21 @@ async def nextturn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Next up: {names_only(current_turn(state))}."
     )
 
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update):
+        return
+
+    state = load_state()
+    state["turn_index"] = 0
+    state["acknowledged"] = False
+    save_state(state)
+
+    await update.message.reply_text(
+        "🔄 <b>Rotation Restarted!</b>\n\n"
+        "The schedule has been reset back to Week 1 (Danial & Pourya).",
+        parse_mode=ParseMode.HTML
+    )
+
 async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_owner(update):
         return
@@ -365,32 +362,6 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Got it — I'll send reminders to this chat from now on.\n\n"
         "The command menu has also been registered specifically for this group."
     )
-
-async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != "private":
-        await update.message.delete()
-        await update.message.reply_text("Shh! Send reviews to me in a direct private chat to stay anonymous.")
-        return
-
-    review_text = " ".join(context.args)
-    if not review_text:
-        await update.message.reply_text("Usage: /review <your secret comment>")
-        return
-
-    state = load_state()
-    group_id = state.get("group_chat_id")
-    
-    if not group_id:
-        await update.message.reply_text("No group registered yet. Run /setgroup in the main chat first.")
-        return
-
-    await context.bot.send_message(
-        chat_id=group_id,
-        text=f"🕵️ <b>Anonymous House Review:</b>\n\n<i>\"{review_text}\"</i>",
-        parse_mode=ParseMode.HTML
-    )
-    
-    await update.message.reply_text("Your secret review has been sent to the group!")
 
 # ---------------------------------------------------------------------------
 # Callback handlers
@@ -428,9 +399,19 @@ async def finish_button_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     await query.edit_message_text(text=f"🎉 {clicker.first_name} finished the cleaning! Great job.")
 
+    # 1. Send the Anonymous Poll
+    group_id = state.get("group_chat_id") or query.message.chat_id
+    
+    await context.bot.send_poll(
+        chat_id=group_id,
+        question=f"How did {names_only(people)} do on their cleaning duty this week?",
+        options=POLL_OPTIONS,
+        is_anonymous=True,
+    )
+
+    # 2. Advance the Turn and Announce Next Week
     advance_turn(state)
     next_turn_text = build_whoseturn_text(state)
-    group_id = state.get("group_chat_id") or query.message.chat_id
     
     await context.bot.send_message(
         chat_id=group_id,
@@ -495,8 +476,8 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("whoseturn", whoseturn_command))
     app.add_handler(CommandHandler("schedule", schedule_command))
-    app.add_handler(CommandHandler("review", review_command))
     app.add_handler(CommandHandler("nextturn", nextturn_command))
+    app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("setgroup", setgroup_command))
 
     # Callbacks
