@@ -50,7 +50,7 @@ TOKEN = os.environ.get("HC_BOT_TOKEN")
 
 # Put your Telegram numeric user ID here. 
 # 0 means everyone is treated as owner.
-OWNER_ID = 0
+OWNER_ID = 1738272640
 
 # ---------------------------------------------------------------------------
 # Cleaning rotation
