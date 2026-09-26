@@ -249,15 +249,17 @@ def build_whoseturn_text(state: dict) -> str:
     return f"This weekend it's {names_only(current_turn(state))}'s turn ({status})."
 
 def build_schedule_text(state: dict) -> str:
-    lines = ["📅 <b>Weekly Cleaning Schedule</b>\n"]
-    current_idx = state["turn_index"] % len(TURNS)
-
-    for i, people in enumerate(TURNS):
-        marker = "👉" if i == current_idx else "  "
-        lines.append(f"{marker} Week {i + 1}: {names_only(people)}")
-
-    lines.append("\n(Rotation repeats after the last week.)")
-    return "\n".join(lines)
+    """
+    Manually set schedule text.
+    """
+    return (
+        "📅 <b>Weekly Cleaning Schedule</b>\n\n"
+        "🔹 <b>Week 1:</b> Danial & Pourya\n"
+        "🔹 <b>Week 2:</b> Alireza\n"
+        "🔹 <b>Week 3:</b> Soroush & Aydin\n"
+        "🔹 <b>Week 4:</b> Daniele\n\n"
+        "<i>(The rotation repeats after Week 4)</i>"
+    )
 
 def reminder1_text(people: list) -> str:
     return f"Heads up {mentions_joined(people)} — you're on cleaning + trash duty this weekend! Tap below to accept the job."
