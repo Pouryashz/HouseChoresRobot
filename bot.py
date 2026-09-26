@@ -14,16 +14,25 @@ Three-stage reminder flow:
 Clicking the button at any point cancels the remaining reminders for
 that week. Anyone on the current turn's tapping counts.
 
+Owner-only commands: /nextturn and /setgroup only work for OWNER_ID.
+Anyone else gets a random funny refusal.
+
 Setup:
-1. pip install python-telegram-bot==21.*
+1. pip install -r requirements.txt
 2. Set your bot token as an environment variable (don't hardcode it!):
      export HC_BOT_TOKEN="your-token-here"
 3. Fill in TURNS below. For each person give a "name", and EITHER a
    "username" (without the @) OR a "user_id" (numeric). A username is
    enough to @-tag them; if they don't have one, use their numeric
    user_id instead (get it by having them run /myid in the group).
-4. Run: python bot.py
-5. Add the bot to your group and send /setgroup once inside it.
+4. Set OWNER_ID below to your own numeric Telegram ID (run /myid to
+   get it once the bot is running).
+5. Run: python bot.py
+6. Add the bot to your group and send /setgroup once inside it.
+
+To preview message output without running the bot at all, see
+test_preview.py - it imports the text-building functions from this
+file directly and prints them to the console.
 """
 
 import json
@@ -51,10 +60,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 TOKEN = os.environ.get("HC_BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError(
-        "Set the HC_BOT_TOKEN environment variable before running the bot."
-    )
+
+# Your numeric Telegram user ID. Only this ID can run "major" commands
+# (/nextturn, /setgroup). Run /myid in the bot to find your own ID, then
+# put it here. Left as 0 until you fill it in - 0 means "no owner set",
+# in which case owner-only commands are open to everyone (fine for
+# initial testing, but set this before real use).
+OWNER_ID = 0
 
 # Each turn is a list of people. Most turns have one person, some have two.
 # For each person: "name" is required. Give "username" (no @) if they have
@@ -87,6 +99,7 @@ REMINDER_2 = dict(weekday=5, hour=10, minute=0)   # Saturday morning
 REMINDER_3 = dict(weekday=5, hour=16, minute=0)   # Saturday afternoon (warning)
 
 ACK_CALLBACK = "ack_turn"
+SCHEDULE_CALLBACK = "show_schedule"
 
 FUNNY_WARNINGS = [
     "The trash is filing a missing person's report on {names}.",
@@ -96,6 +109,15 @@ FUNNY_WARNINGS = [
     "Breaking news: {names} has not been seen anywhere near a trash bag. "
     "Search parties are forming.",
     "{names}, the dust bunnies are unionizing. This is your last warning.",
+]
+
+# Shown to anyone who isn't OWNER_ID and tries an owner-only command.
+DENIED_MESSAGES = [
+    "I'm not working for you!",
+    "Nice try. This button only listens to one person, and it's not you.",
+    "Access denied. Please direct all complaints to management (Pourya).",
+    "I only take orders from my one true boss. You are not him.",
+    "Sorry, that command requires a level of authority you simply do not have.",
 ]
 
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -155,10 +177,85 @@ def is_person_in_turn(user_id: int, username: str, people: list) -> bool:
     return False
 
 
+def is_owner(user_id: int) -> bool:
+    if OWNER_ID == 0:
+        return True  # no owner configured yet - open to everyone
+    return user_id == OWNER_ID
+
+
 def ack_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("OK - I'll do it", callback_data=ACK_CALLBACK)]]
     )
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📅 Weekly Schedule", callback_data=SCHEDULE_CALLBACK)]]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Text builders (pure functions - no Telegram calls, easy to test/preview)
+# ---------------------------------------------------------------------------
+
+
+def build_whoseturn_text(state: dict) -> str:
+    status = "already confirmed" if state["acknowledged"] else "not confirmed yet"
+    return f"This weekend it's {names_only(current_turn(state))}'s turn ({status})."
+
+
+def build_schedule_text(state: dict) -> str:
+    lines = ["📅 <b>Weekly Cleaning Schedule</b>\n"]
+    current_idx = state["turn_index"] % len(TURNS)
+    for i, people in enumerate(TURNS):
+        marker = "👉" if i == current_idx else "  "
+        lines.append(f"{marker} Week {i + 1}: {names_only(people)}")
+    lines.append("\n(Rotation repeats after the last week.)")
+    return "\n".join(lines)
+
+
+def reminder1_text(people: list) -> str:
+    return (
+        f"Heads up {mentions_joined(people)} — you're on cleaning + trash "
+        f"duty this weekend! Tap below once you're planning to handle it."
+    )
+
+
+def reminder2_text(people: list) -> str:
+    return (
+        f"Morning reminder: {mentions_joined(people)}, it's still your "
+        f"turn to clean and take out the trash this weekend. Tap the "
+        f"button once it's sorted!"
+    )
+
+
+def reminder3_text(people: list, warning_index: int = None) -> str:
+    warning = (
+        FUNNY_WARNINGS[warning_index]
+        if warning_index is not None
+        else random.choice(FUNNY_WARNINGS)
+    )
+    return warning.format(names=mentions_joined(people))
+
+
+def denied_text(index: int = None) -> str:
+    return DENIED_MESSAGES[index] if index is not None else random.choice(DENIED_MESSAGES)
+
+
+# ---------------------------------------------------------------------------
+# Owner-only guard
+# ---------------------------------------------------------------------------
+
+
+async def require_owner(update: Update) -> bool:
+    """Returns True if the caller is allowed to proceed; otherwise sends a
+    funny refusal and returns False."""
+    user = update.effective_user
+    if is_owner(user.id):
+        return True
+    await update.message.reply_text(denied_text())
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -173,24 +270,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "confirms.\n\n"
         "Commands:\n"
         "/whoseturn - see whose turn it is right now\n"
-        "/nextturn - manually advance to the next turn\n"
-        "/setgroup - run this inside your group chat so I know where "
-        "to send reminders\n"
-        "/myid - get your Telegram numeric ID (useful if you don't "
-        "have a username set)"
+        "/schedule - see the full weekly rotation\n"
+        "/nextturn - manually advance to the next turn (owner only)\n"
+        "/setgroup - run this inside your group chat (owner only)\n"
+        "/myid - get your Telegram numeric ID",
+        reply_markup=start_keyboard(),
     )
 
 
 async def whoseturn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
-    status = "already confirmed" if state["acknowledged"] else "not confirmed yet"
-    await update.message.reply_text(
-        f"This weekend it's {names_only(current_turn(state))}'s turn "
-        f"({status})."
+    await update.message.reply_text(build_whoseturn_text(state))
+
+
+async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    await update.message.reply_text(build_schedule_text(state), parse_mode=ParseMode.HTML)
+
+
+async def schedule_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    state = load_state()
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=build_schedule_text(state),
+        parse_mode=ParseMode.HTML,
     )
 
 
 async def nextturn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update):
+        return
     state = load_state()
     finished = names_only(current_turn(state))
     advance_turn(state)
@@ -200,6 +311,8 @@ async def nextturn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update):
+        return
     state = load_state()
     state["group_chat_id"] = update.effective_chat.id
     save_state(state)
@@ -262,32 +375,17 @@ async def _send(context: ContextTypes.DEFAULT_TYPE, text: str, with_button: bool
 
 async def reminder_1(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
-    people = current_turn(state)
-    await _send(
-        context,
-        f"Heads up {mentions_joined(people)} — you're on cleaning + trash "
-        f"duty this weekend! Tap below once you're planning to handle it.",
-        with_button=True,
-    )
+    await _send(context, reminder1_text(current_turn(state)), with_button=True)
 
 
 async def reminder_2(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
-    people = current_turn(state)
-    await _send(
-        context,
-        f"Morning reminder: {mentions_joined(people)}, it's still your "
-        f"turn to clean and take out the trash this weekend. Tap the "
-        f"button once it's sorted!",
-        with_button=True,
-    )
+    await _send(context, reminder2_text(current_turn(state)), with_button=True)
 
 
 async def reminder_3(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
-    people = current_turn(state)
-    warning = random.choice(FUNNY_WARNINGS).format(names=mentions_joined(people))
-    await _send(context, warning, with_button=True)
+    await _send(context, reminder3_text(current_turn(state)), with_button=True)
 
 
 # ---------------------------------------------------------------------------
@@ -296,14 +394,23 @@ async def reminder_3(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not TOKEN:
+        raise RuntimeError(
+            "Set the HC_BOT_TOKEN environment variable before running the bot."
+        )
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("whoseturn", whoseturn_command))
+    app.add_handler(CommandHandler("schedule", schedule_command))
     app.add_handler(CommandHandler("nextturn", nextturn_command))
     app.add_handler(CommandHandler("setgroup", setgroup_command))
     app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(CallbackQueryHandler(ack_button_handler, pattern=f"^{ACK_CALLBACK}$"))
+    app.add_handler(
+        CallbackQueryHandler(schedule_button_handler, pattern=f"^{SCHEDULE_CALLBACK}$")
+    )
 
     for cfg, job in ((REMINDER_1, reminder_1), (REMINDER_2, reminder_2), (REMINDER_3, reminder_3)):
         app.job_queue.run_daily(
