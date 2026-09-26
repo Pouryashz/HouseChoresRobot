@@ -48,8 +48,8 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("HC_BOT_TOKEN")
 
-# Put your Telegram numeric user ID here. 
-# 0 means everyone is treated as owner.
+# Your specific Telegram numeric ID. 
+# Only you can use /nextturn, /restart, and /setgroup.
 OWNER_ID = 1738272640
 
 # ---------------------------------------------------------------------------
@@ -79,9 +79,10 @@ TURNS = [
 
 TIMEZONE = ZoneInfo("Europe/Rome")
 
-REMINDER_1 = {"weekday": 4, "hour": 19, "minute": 0}
-REMINDER_2 = {"weekday": 5, "hour": 10, "minute": 0}
-REMINDER_3 = {"weekday": 5, "hour": 16, "minute": 0}
+# Python weekdays: Saturday = 5, Sunday = 6
+REMINDER_1 = {"weekday": 5, "hour": 20, "minute": 0}  # Saturday 8:00 PM
+REMINDER_2 = {"weekday": 6, "hour": 10, "minute": 0}  # Sunday 10:00 AM
+REMINDER_3 = {"weekday": 6, "hour": 16, "minute": 0}  # Sunday 4:00 PM (Last warning)
 
 # ---------------------------------------------------------------------------
 # Callback identifiers
@@ -92,7 +93,7 @@ FINISH_CALLBACK = "finish_turn"
 SCHEDULE_CALLBACK = "show_schedule"
 
 # ---------------------------------------------------------------------------
-# Funny messages
+# Funny messages & Poll Options
 # ---------------------------------------------------------------------------
 
 FUNNY_WARNINGS = [
