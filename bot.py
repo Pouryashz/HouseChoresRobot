@@ -1,39 +1,29 @@
 """
-HOUSE CLEANING BOT
-==================
+House Cleaning Bot
+------------------
 
-Cleaning rotation:
-    - Each turn lasts Sunday -> Saturday.
-    - A new person/group gets the turn every Sunday.
-    - Reminders are sent 3 times per day:
-        09:00
-        15:00
-        21:00
-      Europe/Rome time.
-    - Reminders stop when the person whose turn it is accepts.
-    - Finishing the cleaning does NOT advance the rotation.
-    - The next Sunday advances the rotation automatically.
+Rotates through a list of turns and reminds the group whose turn it is
+to clean the house / take out the trash.
 
-IMPORTANT:
-    The reminder system intentionally does NOT rely on run_daily().
-    Instead, a watchdog runs every 20 seconds and checks the
-    Europe/Rome clock.
-
-Install:
-    pip install -U "python-telegram-bot[job-queue]"
-
-Environment variables:
-    HC_BOT_TOKEN=your_token
-
-Optional:
-    HC_GROUP_CHAT_ID=-100xxxxxxxxxx
+Flow
+----
+1. Every REMINDER_EVERY_HOURS hours (between REMINDER_START_HOUR and
+   REMINDER_END_HOUR) the bot posts a reminder with an "Accept Turn" button,
+   until someone on duty accepts. This runs on its own - nobody needs to
+   press /whoseturn.
+2. The person on duty accepts, cleans, then presses "Mark as Finished".
+3. The bot posts an anonymous rating poll.
+4. As soon as everyone who is NOT on duty has voted, the bot closes the poll
+   and automatically moves on to the next turn (or after RATING_TIMEOUT_HOURS
+   if not everybody votes).
 """
 
+import html
 import json
 import logging
 import os
 import random
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -44,207 +34,131 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
-    BotCommandScopeDefault,
     BotCommandScopeChat,
+    BotCommandScopeDefault,
 )
-
 from telegram.constants import ParseMode
-
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    PollHandler,
     ContextTypes,
 )
 
-
-# ============================================================================
-# LOGGING
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
 )
+logger = logging.getLogger(__name__)
 
-logger = logging.getLogger("HouseCleaningBot")
-
-
-# ============================================================================
-# CONFIG
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 TOKEN = os.environ.get("HC_BOT_TOKEN")
 
-if not TOKEN:
-    raise RuntimeError(
-        "HC_BOT_TOKEN is not set."
-    )
-
-
+# Your specific Telegram numeric ID.
+# Only you can use /nextturn, /restart, /setgroup, /testreminder.
 OWNER_ID = 1738272640
 
-
-TIMEZONE = ZoneInfo("Europe/Rome")
-
-
-# ============================================================================
-# REMINDER TIMES
-# ============================================================================
-
-# IMPORTANT:
-# These are interpreted as EUROPE/ROME times.
-#
-# 09:00
-# 15:00
-# 21:00
-
-REMINDER_SLOTS = {
-    "09:00",
-    "15:00",
-    "21:00",
-}
-
-
-# How often the watchdog checks the clock.
-#
-# 20 seconds is more than enough.
-WATCHDOG_INTERVAL_SECONDS = 20
-
-
-# ============================================================================
-# GROUP
-# ============================================================================
-
-ENV_GROUP_CHAT_ID = os.environ.get(
-    "HC_GROUP_CHAT_ID"
-)
-
-if ENV_GROUP_CHAT_ID:
-
-    try:
-        ENV_GROUP_CHAT_ID = int(
-            ENV_GROUP_CHAT_ID
-        )
-
-    except ValueError:
-
-        raise RuntimeError(
-            "HC_GROUP_CHAT_ID must be a Telegram numeric chat ID."
-        )
-
-
-# ============================================================================
-# CLEANING ROTATION
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Cleaning rotation
+# ---------------------------------------------------------------------------
 
 TURNS = [
-
     [
-        {
-            "name": "Danial",
-            "username": "D4NYAL_BK",
-        },
-        {
-            "name": "Pourya",
-            "username": "Pouryashahbazzadeh",
-        },
+        {"name": "Danial", "username": "D4NYAL_BK"},
+        {"name": "Pourya", "username": "Pouryashahbazzadeh"},
     ],
-
     [
-        {
-            "name": "Alireza",
-            "username": "Deartahmasebi",
-        },
+        {"name": "Alireza", "username": "Deartahmasebi"},
     ],
-
     [
-        {
-            "name": "Soroush",
-            "username": "try38474727",
-        },
-        {
-            "name": "Aydin",
-            "username": "Aydin_Pouladvand",
-        },
+        {"name": "Soroush", "username": "try38474727"},
+        {"name": "Aydin", "username": "Aydin_Pouladvand"},
     ],
-
     [
-        {
-            "name": "Daniele",
-
-            # ADD DANIELE'S USERNAME OR USER ID HERE.
-            #
-            # Example:
-            # "username": "daniele123"
-            #
-            # or:
-            # "user_id": 123456789
-        },
+        {"name": "Daniele"},
     ],
 ]
 
+# Total number of people in the house (used to know how many votes we need).
+TOTAL_HOUSEMATES = sum(len(turn) for turn in TURNS)
 
-# ============================================================================
-# CALLBACKS
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Time / reminders
+# ---------------------------------------------------------------------------
+
+TIMEZONE = ZoneInfo("Europe/Rome")
+
+# Reminders go out every REMINDER_EVERY_HOURS hours, from START to END hour
+# (inclusive), until the person on duty accepts the turn.
+# With 9 / 21 / 3 this gives: 09:00, 12:00, 15:00, 18:00, 21:00.
+REMINDER_START_HOUR = 9
+REMINDER_END_HOUR = 21
+REMINDER_EVERY_HOURS = 3
+
+REMINDER_TIMES = [
+    time(hour=h, minute=0, tzinfo=TIMEZONE)
+    for h in range(REMINDER_START_HOUR, REMINDER_END_HOUR + 1, REMINDER_EVERY_HOURS)
+]
+
+# If not everybody has rated after this long, move on to the next turn anyway.
+RATING_TIMEOUT_HOURS = 48
+
+# Delete the previous reminder when a new one is sent (keeps the chat tidy).
+# Needs the bot to be allowed to delete messages; harmless if it can't.
+DELETE_OLD_REMINDERS = True
+
+# Sends a confirmation message every time the bot boots.
+# Set to False once you are done testing.
+SEND_STARTUP_MESSAGE = True
+
+# ---------------------------------------------------------------------------
+# Callback identifiers
+# ---------------------------------------------------------------------------
 
 ACCEPT_CALLBACK = "accept_turn"
 FINISH_CALLBACK = "finish_turn"
 SCHEDULE_CALLBACK = "show_schedule"
 
+# ---------------------------------------------------------------------------
+# Funny messages & Poll Options
+# ---------------------------------------------------------------------------
 
-# ============================================================================
-# FUNNY MESSAGES
-# ============================================================================
+STARTUP_MESSAGES = [
+    "I'm gonna teach you how to be clean! 🧹",
+    "I'm back online. Your dust bunnies have been notified. 🐰",
+    "Fresh code, same mission: making you clean. 🧼",
+]
 
 FUNNY_WARNINGS = [
-
     "The trash is filing a missing person's report on {names}.",
-
-    "{names}, the broom has started a countdown. "
-    "It is not a fan of being ignored.",
-
-    "{names}, the dishes are staging a silent protest. "
-    "Unfortunately, the protest is against YOU.",
-
-    "Breaking news: {names} has not been seen anywhere near a trash bag. "
-    "Search parties are forming.",
-
-    "{names}, the dust bunnies are unionizing.",
-
-    "{names}, your cleaning responsibilities would like to remind you "
-    "that they still exist.",
-
-    "🚨 CLEANING POLICE 🚨 "
-    "{names} have been reported for suspicious levels of uncleanliness.",
-
-    "The house called. "
-    "It wants {names} to stop pretending they don't live here.",
-
-    "🧹 {names}, this is your final warning before the broom develops "
-    "sentience and comes looking for you.",
+    "{names}, the broom has started a countdown. It is not a fan of being ignored.",
+    "{names}, the dishes are staging a silent protest. Emphasis on silent, because you still haven't shown up.",
+    "Breaking news: {names} has not been seen anywhere near a trash bag. Search parties are forming.",
+    "{names}, the dust bunnies are unionizing. This is your last warning.",
+    "{names}, the vacuum cleaner just texted me. It says it feels unloved.",
+    "Scientists confirm the bathroom has developed its own weather system. {names}, please intervene.",
+    "{names}, the mop is wondering if you two are still together.",
+    "Alert: the fridge has started a science experiment without a permit. {names}, report for duty.",
+    "{names}, the floor says it misses you. It has not seen you in a while.",
+    "Dear {names}, the trash can has entered its final form. Please do not wait for the next one.",
+    "{names}, a spider has declared the corner of the kitchen an independent nation. Diplomacy is your job.",
 ]
-
 
 DENIED_MESSAGES = [
-
     "I'm not working for you!",
-
-    "Nice try. That's not your turn 😈",
-
-    "Access denied. Wait for your cleaning week.",
-
-    "You cannot steal somebody else's cleaning turn.",
-
-    "Wrong victim. The broom has selected somebody else.",
+    "Nice try. This button only listens to one person, and it's not you.",
+    "Access denied. Please direct all complaints to management (Pourya).",
+    "I only take orders from my one true boss. You are not him.",
+    "Sorry, that command requires a level of authority you simply do not have.",
 ]
-
 
 POLL_OPTIONS = [
     "Poor 🤢",
@@ -254,1800 +168,665 @@ POLL_OPTIONS = [
     "Perfect ✨",
 ]
 
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
-# ============================================================================
-# STATE
-# ============================================================================
-
-STATE_FILE = (
-    Path(__file__).parent / "state.json"
-)
+# If your host wipes files on redeploy, point this to a persistent folder,
+# e.g. Path("/data/state.json").
+STATE_FILE = Path(__file__).parent / "state.json"
 
 
-def default_state():
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                state.setdefault("turn_index", 0)
+                state.setdefault("group_chat_id", None)
+                state.setdefault("acknowledged", False)
+                state.setdefault("nag_count", 0)
+                state.setdefault("rating", None)
+                state.setdefault("last_reminder_id", None)
+                return state
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read state.json: %s. Starting fresh.", exc)
 
     return {
-
         "turn_index": 0,
-
-        "turn_start_date": None,
-
-        "group_chat_id": ENV_GROUP_CHAT_ID,
-
-        "acknowledged": False,
-
-        "nag_count": 0,
-
-        # Example:
-        #
-        # "2026-10-07|09:00"
-        #
-        # This prevents the watchdog from sending
-        # the same reminder repeatedly.
-        "sent_slots": [],
-
+        "group_chat_id": None,
+        "acknowledged": False,   # True once someone has accepted the turn
+        "nag_count": 0,          # how many reminders sent for this turn so far
+        "rating": None,          # info about the open rating poll, or None
+        "last_reminder_id": None,  # message id of the latest reminder
     }
 
 
-def load_state():
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
-    if not STATE_FILE.exists():
 
-        logger.info(
-            "state.json does not exist. "
-            "Creating new state."
-        )
+# ---------------------------------------------------------------------------
+# Turn helpers
+# ---------------------------------------------------------------------------
 
-        return default_state()
 
-    try:
+def current_turn(state: dict) -> list:
+    return TURNS[state["turn_index"] % len(TURNS)]
 
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8",
-        ) as f:
 
-            state = json.load(f)
-
-    except Exception as exc:
-
-        logger.exception(
-            "Could not read state.json: %s",
-            exc,
-        )
-
-        return default_state()
-
-    defaults = default_state()
-
-    for key, value in defaults.items():
-
-        state.setdefault(
-            key,
-            value,
-        )
-
-    # Environment variable wins.
-    if ENV_GROUP_CHAT_ID is not None:
-
-        state["group_chat_id"] = (
-            ENV_GROUP_CHAT_ID
-        )
-
-    return state
-
-
-def save_state(state):
-
-    temp_file = STATE_FILE.with_suffix(
-        ".tmp"
-    )
-
-    try:
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                state,
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-        temp_file.replace(
-            STATE_FILE
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Could not save state: %s",
-            exc,
-        )
-
-
-# ============================================================================
-# DATE / WEEK
-# ============================================================================
-
-def now_rome():
-
-    return datetime.now(
-        TIMEZONE
-    )
-
-
-def today_rome():
-
-    return now_rome().date()
-
-
-def current_sunday(
-    d=None,
-):
-
-    if d is None:
-        d = today_rome()
-
-    # Python:
-    #
-    # Monday = 0
-    # Tuesday = 1
-    # ...
-    # Saturday = 5
-    # Sunday = 6
-
-    days_since_sunday = (
-        d.weekday() + 1
-    ) % 7
-
-    return (
-        d
-        - timedelta(
-            days=days_since_sunday
-        )
-    )
-
-
-def ensure_current_week(
-    state,
-):
-
-    this_sunday = current_sunday()
-
-    stored = state.get(
-        "turn_start_date"
-    )
-
-    # First startup.
-    if not stored:
-
-        state["turn_start_date"] = (
-            this_sunday.isoformat()
-        )
-
-        state["acknowledged"] = False
-
-        state["nag_count"] = 0
-
-        state["sent_slots"] = []
-
-        save_state(state)
-
-        logger.info(
-            "Initialized first cleaning week: %s",
-            this_sunday,
-        )
-
-        return False
-
-
-    try:
-
-        stored_sunday = date.fromisoformat(
-            stored
-        )
-
-    except ValueError:
-
-        logger.warning(
-            "Invalid turn_start_date: %s",
-            stored,
-        )
-
-        state["turn_start_date"] = (
-            this_sunday.isoformat()
-        )
-
-        state["acknowledged"] = False
-
-        state["nag_count"] = 0
-
-        state["sent_slots"] = []
-
-        save_state(state)
-
-        return False
-
-
-    # Same week.
-    if stored_sunday == this_sunday:
-
-        return False
-
-
-    # One or more Sundays passed.
-    weeks_passed = (
-        this_sunday - stored_sunday
-    ).days // 7
-
-
-    old_index = state[
-        "turn_index"
-    ]
-
-
-    state["turn_index"] = (
-        old_index + weeks_passed
-    ) % len(TURNS)
-
-
-    state["turn_start_date"] = (
-        this_sunday.isoformat()
-    )
-
-
-    # New week means:
-    # reminders are active again.
+def advance_turn(state: dict) -> None:
+    state["turn_index"] = (state["turn_index"] + 1) % len(TURNS)
     state["acknowledged"] = False
-
     state["nag_count"] = 0
-
-    state["sent_slots"] = []
-
-
+    state["rating"] = None
+    state["last_reminder_id"] = None
     save_state(state)
 
 
-    logger.info(
-        "============================================"
-    )
-
-    logger.info(
-        "NEW CLEANING WEEK"
-    )
-
-    logger.info(
-        "Previous Sunday: %s",
-        stored_sunday,
-    )
-
-    logger.info(
-        "New Sunday: %s",
-        this_sunday,
-    )
-
-    logger.info(
-        "Weeks passed: %s",
-        weeks_passed,
-    )
-
-    logger.info(
-        "Turn index: %s -> %s",
-        old_index,
-        state["turn_index"],
-    )
-
-    logger.info(
-        "New turn: %s",
-        names_only(
-            current_turn(state)
-        ),
-    )
-
-    logger.info(
-        "============================================"
-    )
-
-    return True
+# ---------------------------------------------------------------------------
+# Mention helpers
+# ---------------------------------------------------------------------------
 
 
-# ============================================================================
-# TURN HELPERS
-# ============================================================================
-
-def current_turn(
-    state,
-):
-
-    return TURNS[
-        state["turn_index"]
-        % len(TURNS)
-    ]
-
-
-def names_only(
-    people,
-):
-
-    return " & ".join(
-        person["name"]
-        for person in people
-    )
-
-
-def mention(
-    person,
-):
-
+def mention(person: dict) -> str:
     if person.get("username"):
-
-        return (
-            "@"
-            + person["username"]
-        )
-
+        return f"@{person['username']}"
     if person.get("user_id"):
-
-        return (
-            f'<a href="tg://user?id='
-            f'{person["user_id"]}">'
-            f'{person["name"]}'
-            f"</a>"
-        )
-
-    return person["name"]
+        return f'<a href="tg://user?id={person["user_id"]}">{html.escape(person["name"])}</a>'
+    return html.escape(person["name"])
 
 
-def mentions_joined(
-    people,
-):
-
-    return " & ".join(
-        mention(person)
-        for person in people
-    )
+def names_only(people: list) -> str:
+    return " & ".join(person["name"] for person in people)
 
 
-def is_person_in_turn(
-    user_id,
-    username,
-    people,
-):
+def mentions_joined(people: list) -> str:
+    # Used inside HTML messages, so the "&" must be escaped.
+    return " &amp; ".join(mention(person) for person in people)
 
-    username = (
-        username or ""
-    ).lower().lstrip("@")
 
+def is_person_in_turn(user_id: int, username: str, people: list) -> bool:
+    username = (username or "").lower()
     for person in people:
-
-        if (
-            person.get("user_id")
-            and person["user_id"]
-            == user_id
-        ):
-
+        if person.get("user_id") and person["user_id"] == user_id:
             return True
-
-        configured_username = (
-            person.get("username")
-            or ""
-        ).lower().lstrip("@")
-
-        if (
-            configured_username
-            and configured_username
-            == username
-        ):
-
+        if person.get("username") and person["username"].lower() == username:
             return True
-
     return False
 
 
-# ============================================================================
-# OWNER
-# ============================================================================
-
-def is_owner(
-    user_id,
-):
-
-    return (
-        user_id == OWNER_ID
-    )
+# ---------------------------------------------------------------------------
+# Owner
+# ---------------------------------------------------------------------------
 
 
-async def require_owner(
-    update,
-):
+def is_owner(user_id: int) -> bool:
+    if OWNER_ID == 0:
+        return True
+    return user_id == OWNER_ID
 
+
+async def require_owner(update: Update) -> bool:
     user = update.effective_user
-
-    if not user:
+    if user is None:
         return False
-
     if is_owner(user.id):
         return True
-
-    if update.message:
-
-        await update.message.reply_text(
-            random.choice(
-                DENIED_MESSAGES
-            )
-        )
-
+    await update.message.reply_text(random.choice(DENIED_MESSAGES))
     return False
 
 
-# ============================================================================
-# KEYBOARDS
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Keyboards
+# ---------------------------------------------------------------------------
 
-def accept_keyboard():
 
+def accept_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Accept Turn",
-                    callback_data=(
-                        ACCEPT_CALLBACK
-                    ),
-                )
-            ]
-        ]
+        [[InlineKeyboardButton("✅ Accept Turn", callback_data=ACCEPT_CALLBACK)]]
     )
 
 
-def finish_keyboard():
-
+def finish_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🧹 Mark as Finished",
-                    callback_data=(
-                        FINISH_CALLBACK
-                    ),
-                )
-            ]
-        ]
+        [[InlineKeyboardButton("🧹 Mark as Finished", callback_data=FINISH_CALLBACK)]]
     )
 
 
-def start_keyboard():
-
+def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "📅 Weekly Schedule",
-                    callback_data=(
-                        SCHEDULE_CALLBACK
-                    ),
-                )
-            ]
-        ]
+        [[InlineKeyboardButton("📅 Weekly Schedule", callback_data=SCHEDULE_CALLBACK)]]
     )
 
 
-# ============================================================================
-# TEXT
-# ============================================================================
-
-def reminder_text(
-    state,
-):
-
-    people = current_turn(
-        state
-    )
-
-    if state["nag_count"] == 0:
-
-        return (
-            "🚨 <b>CLEANING DUTY!</b>\n\n"
-            f"Heads up "
-            f"{mentions_joined(people)} — "
-            "you're on cleaning + trash duty "
-            "this week!\n\n"
-            "Tap below to accept your fate. 😈"
-        )
-
-
-    warning = random.choice(
-        FUNNY_WARNINGS
-    )
-
-    return (
-        "🧹 <b>CLEANING REMINDER</b>\n\n"
-        f"{warning}\n\n"
-        "Accept your turn before the broom "
-        "comes for you. 👇"
-    )
-
-
-def build_whoseturn_text(
-    state,
-):
-
-    ensure_current_week(
-        state
-    )
-
-    status = (
-        "accepted — cleaning in progress"
-        if state["acknowledged"]
-        else "NOT accepted yet"
-    )
-
-    return (
-        "🧹 <b>Current Cleaning Turn</b>\n\n"
-        f"<b>{names_only(current_turn(state))}</b>\n\n"
-        f"Week started: "
-        f"<b>{state['turn_start_date']}</b>\n"
-        f"Status: <b>{status}</b>"
-    )
-
-
-def build_schedule_text(
-    state,
-):
-
-    ensure_current_week(
-        state
-    )
-
-    current_index = (
-        state["turn_index"]
-        % len(TURNS)
-    )
-
-    lines = [
-        "📅 <b>Weekly Cleaning Schedule</b>\n"
-    ]
-
-    for i, people in enumerate(
-        TURNS
-    ):
-
-        marker = (
-            "👉"
-            if i == current_index
-            else "🔹"
-        )
-
-        lines.append(
-            f"{marker} "
-            f"<b>Week {i + 1}:</b> "
-            f"{names_only(people)}"
-        )
-
-    lines.append(
-        "\n<i>Rotation changes automatically "
-        "every Sunday.</i>"
-    )
-
-    return "\n".join(
-        lines
-    )
-
-
-# ============================================================================
-# COMMANDS
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Telegram command list
+# ---------------------------------------------------------------------------
 
 BOT_COMMANDS = [
-
-    BotCommand(
-        "start",
-        "Start the bot",
-    ),
-
-    BotCommand(
-        "whoseturn",
-        "See whose turn it is",
-    ),
-
-    BotCommand(
-        "schedule",
-        "See the cleaning schedule",
-    ),
-
-    BotCommand(
-        "setgroup",
-        "Set this group for reminders",
-    ),
-
-    BotCommand(
-        "testreminder",
-        "Send a reminder now",
-    ),
-
-    BotCommand(
-        "testtimer",
-        "Test scheduled sending",
-    ),
-
-    BotCommand(
-        "nextturn",
-        "Advance turn manually",
-    ),
-
-    BotCommand(
-        "restart",
-        "Restart rotation",
-    ),
+    BotCommand("start", "Start the bot"),
+    BotCommand("whoseturn", "See whose turn it is right now"),
+    BotCommand("schedule", "See the full weekly rotation"),
+    BotCommand("nextturn", "Advance to the next turn (owner only)"),
+    BotCommand("restart", "Restart rotation to Week 1 (owner only)"),
+    BotCommand("setgroup", "Set this chat for reminders (owner only)"),
+    BotCommand("testreminder", "Send a reminder right now, for testing (owner only)"),
 ]
 
+# ---------------------------------------------------------------------------
+# Text builders
+# ---------------------------------------------------------------------------
 
-# ============================================================================
-# START
-# ============================================================================
 
-async def start_command(
-    update,
-    context,
-):
+def reminder_times_text() -> str:
+    return ", ".join(t.strftime("%H:%M") for t in REMINDER_TIMES)
 
-    if (
-        update.effective_chat
-        and update.effective_chat.type
-        in ("group", "supergroup")
-        and update.effective_user
-        and is_owner(
-            update.effective_user.id
+
+def build_whoseturn_text(state: dict) -> str:
+    if state.get("rating"):
+        status = "finished, waiting for everyone to rate"
+    elif state["acknowledged"]:
+        status = "accepted, cleaning in progress"
+    else:
+        status = "not accepted yet"
+    return f"This week it's {names_only(current_turn(state))}'s turn ({status})."
+
+
+def build_schedule_text(state: dict) -> str:
+    current_idx = state["turn_index"] % len(TURNS)
+    lines = ["📅 <b>Weekly Cleaning Schedule</b>\n"]
+    for i, people in enumerate(TURNS):
+        marker = "👉" if i == current_idx else "🔹"
+        lines.append(f"{marker} <b>Week {i + 1}:</b> {html.escape(names_only(people))}")
+    lines.append("\n<i>(The rotation repeats after the last week.)</i>")
+    return "\n".join(lines)
+
+
+def reminder1_text(people: list) -> str:
+    return (
+        f"Heads up {mentions_joined(people)} — you're on cleaning + trash "
+        f"duty this round! Tap below to accept the job."
+    )
+
+
+def nag_text(people: list) -> str:
+    warning = random.choice(FUNNY_WARNINGS)
+    return warning.format(names=mentions_joined(people))
+
+
+# ---------------------------------------------------------------------------
+# Command registration
+# ---------------------------------------------------------------------------
+
+
+async def register_commands_for_chat(bot, chat_id: int) -> list:
+    chat_scope = BotCommandScopeChat(chat_id=chat_id)
+    await bot.set_my_commands(BOT_COMMANDS, scope=chat_scope)
+    return await bot.get_my_commands(scope=chat_scope)
+
+
+# ---------------------------------------------------------------------------
+# Startup confirmation
+# ---------------------------------------------------------------------------
+
+
+async def notify_owner(bot, text: str) -> None:
+    """DM the owner. Only works if the owner has pressed Start on the bot."""
+    try:
+        await bot.send_message(chat_id=OWNER_ID, text=text)
+    except Exception:
+        logger.exception("Could not DM owner (have you pressed Start on the bot in private?)")
+
+
+async def send_startup_confirmation(bot, state: dict) -> None:
+    """Proves the message-sending mechanism works every time the bot boots."""
+    if not SEND_STARTUP_MESSAGE:
+        return
+
+    chat_id = state.get("group_chat_id")
+
+    if not chat_id:
+        await notify_owner(
+            bot,
+            "⚠️ Bot started, but NO group is set, so reminders will NOT be sent.\n"
+            "Run /setgroup in the group chat. (If you already did, the host probably "
+            "reset state.json.)",
         )
-    ):
+        return
 
-        state = load_state()
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"{random.choice(STARTUP_MESSAGES)}\n\n"
+                f"(Test OK. Reminders go out daily at {reminder_times_text()} "
+                f"until the turn is accepted.)"
+            ),
+        )
+        logger.info("Startup confirmation sent to chat %s", chat_id)
+    except Exception as exc:
+        logger.exception("Startup confirmation FAILED for chat %s", chat_id)
+        await notify_owner(bot, f"❌ Could not send to the group ({chat_id}): {exc}")
 
-        state["group_chat_id"] = (
-            update.effective_chat.id
+
+async def post_init(application: Application) -> None:
+    logger.info("Registering Telegram bot commands...")
+    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+    logger.info("Global Telegram command registration complete.")
+
+    # Log current state on every startup - makes "why didn't it send"
+    # questions answerable from the logs alone.
+    state = load_state()
+    logger.info(
+        "Startup state: turn_index=%s (%s), group_chat_id=%s, acknowledged=%s, "
+        "nag_count=%s, rating_open=%s",
+        state["turn_index"],
+        names_only(current_turn(state)),
+        state.get("group_chat_id"),
+        state["acknowledged"],
+        state.get("nag_count", 0),
+        bool(state.get("rating")),
+    )
+    logger.info("Reminder times (%s): %s", TIMEZONE, reminder_times_text())
+    if not state.get("group_chat_id"):
+        logger.warning(
+            "No group_chat_id set - reminders will NOT be sent until "
+            "someone runs /setgroup in the target chat."
         )
 
-        save_state(state)
-
-        logger.info(
-            "Group automatically registered: %s",
-            update.effective_chat.id,
-        )
+    await send_startup_confirmation(application.bot, state)
 
 
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-
-        "🧹 <b>House Cleaning Bot</b>\n\n"
-
-        "I manage the cleaning rotation.\n\n"
-
-        "• Sunday → new cleaning turn\n"
-        "• 09:00 → reminder\n"
-        "• 15:00 → reminder\n"
-        "• 21:00 → reminder\n"
-        "• Accept → reminders stop\n\n"
-
-        "/whoseturn\n"
-        "/schedule\n\n"
-
-        "Admin:\n"
-        "/setgroup\n"
-        "/testreminder\n"
-        "/testtimer\n"
-        "/nextturn\n"
-        "/restart",
-
-        parse_mode=ParseMode.HTML,
-
+        "Hi! I track whose turn it is to clean the house and take out the "
+        "trash, and I nag every few hours until the person on duty accepts the "
+        "job! 🧹\n\n"
+        "Here is what I can do:\n"
+        "/whoseturn - See whose turn it is right now\n"
+        "/schedule - See the full weekly rotation\n\n"
+        "Admin commands:\n"
+        "/nextturn - Advance to the next turn\n"
+        "/restart - Reset the schedule back to Week 1\n"
+        "/setgroup - Set this chat for reminders\n"
+        "/testreminder - Send a reminder right now, for testing",
         reply_markup=start_keyboard(),
     )
 
 
-# ============================================================================
-# SET GROUP
-# ============================================================================
+async def whoseturn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    text = build_whoseturn_text(state)
 
-async def setgroup_command(
-    update,
-    context,
-):
+    if state.get("rating"):
+        await update.message.reply_text(text)
+    elif state["acknowledged"]:
+        await update.message.reply_text(text, reply_markup=finish_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=accept_keyboard())
 
-    if not await require_owner(
-        update
-    ):
+
+async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    await update.message.reply_text(build_schedule_text(state), parse_mode=ParseMode.HTML)
+
+
+async def nextturn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update):
+        return
+
+    state = load_state()
+
+    # If a rating poll is open, close it first.
+    rating = state.get("rating")
+    if rating:
+        try:
+            await context.bot.stop_poll(
+                chat_id=rating["chat_id"], message_id=rating["message_id"]
+            )
+        except Exception:
+            logger.warning("Could not stop poll during /nextturn", exc_info=True)
+
+    finished = names_only(current_turn(state))
+    advance_turn(state)
+
+    await update.message.reply_text(
+        f"Manually advanced. Thanks {finished}!\n"
+        f"Next up: {names_only(current_turn(state))}."
+    )
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update):
+        return
+
+    state = load_state()
+    state["turn_index"] = 0
+    state["acknowledged"] = False
+    state["nag_count"] = 0
+    state["rating"] = None
+    state["last_reminder_id"] = None
+    save_state(state)
+
+    await update.message.reply_text(
+        "🔄 <b>Rotation Restarted!</b>\n\n"
+        "The schedule has been reset back to Week 1 (Danial &amp; Pourya).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_owner(update):
         return
 
     chat = update.effective_chat
-
-    if not chat:
-
-        await update.message.reply_text(
-            "I can't determine this chat."
-        )
-
+    if chat is None:
+        await update.message.reply_text("I couldn't determine which chat this is.")
         return
-
-
-    if chat.type not in (
-        "group",
-        "supergroup",
-    ):
-
-        await update.message.reply_text(
-            "Run /setgroup inside the group."
-        )
-
-        return
-
 
     state = load_state()
-
-    state["group_chat_id"] = (
-        chat.id
-    )
-
+    state["group_chat_id"] = chat.id
     save_state(state)
 
-
     try:
-
-        await context.bot.set_my_commands(
-            BOT_COMMANDS,
-            scope=BotCommandScopeChat(
-                chat_id=chat.id
-            ),
-        )
-
+        await register_commands_for_chat(context.bot, chat.id)
     except Exception:
-
-        logger.exception(
-            "Could not register group commands."
-        )
-
-
-    logger.info(
-        "GROUP SET: %s",
-        chat.id,
-    )
-
+        logger.exception("Failed to register commands for chat %s", chat.id)
+        await update.message.reply_text("Group saved, but I couldn't register the command menu. Check logs.")
+        return
 
     await update.message.reply_text(
-
-        "✅ <b>Group configured!</b>\n\n"
-
-        f"Chat ID: "
-        f"<code>{chat.id}</code>\n\n"
-
-        "Reminder system is armed.\n"
-        "It checks the Europe/Rome clock "
-        "every 20 seconds.",
-
-        parse_mode=ParseMode.HTML,
+        "Got it — I'll send reminders to this chat from now on, "
+        f"every few hours ({reminder_times_text()}) until someone accepts the turn.\n\n"
+        "The command menu has also been registered specifically for this group."
     )
 
 
-# ============================================================================
-# WHOSE TURN
-# ============================================================================
-
-async def whoseturn_command(
-    update,
-    context,
-):
-
-    state = load_state()
-
-    ensure_current_week(
-        state
-    )
-
-    if state["acknowledged"]:
-
-        await update.message.reply_text(
-            build_whoseturn_text(
-                state
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=finish_keyboard(),
-        )
-
-    else:
-
-        await update.message.reply_text(
-            build_whoseturn_text(
-                state
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=accept_keyboard(),
-        )
-
-
-# ============================================================================
-# SCHEDULE
-# ============================================================================
-
-async def schedule_command(
-    update,
-    context,
-):
-
-    state = load_state()
-
-    ensure_current_week(
-        state
-    )
-
-    await update.message.reply_text(
-        build_schedule_text(
-            state
-        ),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# ============================================================================
-# TEST REMINDER
-# ============================================================================
-
-async def testreminder_command(
-    update,
-    context,
-):
-
-    if not await require_owner(
-        update
-    ):
+async def testreminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: fires a reminder immediately, in THIS chat,
+    regardless of the schedule or whether group_chat_id is set.
+    Does not touch nag_count or acknowledged state."""
+    if not await require_owner(update):
         return
 
     state = load_state()
-
-    ensure_current_week(
-        state
-    )
+    people = current_turn(state)
+    text = reminder1_text(people) if state["nag_count"] == 0 else nag_text(people)
 
     await update.message.reply_text(
-
-        "🧪 <b>TEST REMINDER</b>\n\n"
-        + reminder_text(state),
-
+        f"[TEST — not counted, not affecting the real schedule]\n\n{text}",
         parse_mode=ParseMode.HTML,
-
         reply_markup=accept_keyboard(),
     )
 
 
-# ============================================================================
-# TEST TIMER
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Rating completion (auto-advance)
+# ---------------------------------------------------------------------------
 
-async def testtimer_command(
-    update,
-    context,
-):
 
-    if not await require_owner(
-        update
-    ):
+async def complete_rating(bot, state: dict, reason: str) -> None:
+    """Close the open rating poll and move to the next turn."""
+    rating = state.get("rating")
+    if not rating:
         return
 
+    chat_id = rating["chat_id"]
 
-    chat_id = (
-        update.effective_chat.id
-    )
-
-
-    # Schedule a one-off test exactly
-    # 60 seconds from now.
-    when = datetime.now(
-        TIMEZONE
-    ) + timedelta(
-        seconds=60
-    )
-
-
-    context.job_queue.run_once(
-
-        scheduled_test_message,
-
-        when=when,
-
-        chat_id=chat_id,
-
-        name=(
-            "TEST_TIMER_"
-            + str(chat_id)
-        ),
-    )
-
-
-    now = now_rome()
-
-
-    await update.message.reply_text(
-
-        "⏱️ <b>Timer test armed.</b>\n\n"
-
-        f"Current Rome time:\n"
-        f"<code>{now.strftime('%Y-%m-%d %H:%M:%S')}</code>\n\n"
-
-        f"I will send the test message at:\n"
-        f"<code>{when.strftime('%Y-%m-%d %H:%M:%S')}</code>\n\n"
-
-        "If you receive it, the hosting scheduler "
-        "is working correctly.",
-
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def scheduled_test_message(
-    context,
-):
-
-    chat_id = (
-        context.job.chat_id
-    )
-
-    now = now_rome()
-
-    logger.info(
-        "================================================"
-    )
-
-    logger.info(
-        "⏰ TEST TIMER FIRED"
-    )
-
-    logger.info(
-        "Rome time: %s",
-        now.isoformat(),
-    )
-
-    logger.info(
-        "Sending test message to %s",
-        chat_id,
-    )
+    # Clear the rating first so the extra "poll closed" update is ignored
+    # and this can never run twice for the same poll.
+    state["rating"] = None
+    save_state(state)
 
     try:
-
-        await context.bot.send_message(
-
-            chat_id=chat_id,
-
-            text=(
-                "🧪🔥 <b>SCHEDULED MESSAGE TEST PASSED!</b>\n\n"
-
-                "I'm gonna teach you how to be clean! "
-                "Whether you like it or not. 😈🧹\n\n"
-
-                "The timer actually fucking worked."
-            ),
-
-            parse_mode=ParseMode.HTML,
-        )
-
-        logger.info(
-            "✅ TEST TIMER MESSAGE SENT"
-        )
-
+        await bot.stop_poll(chat_id=chat_id, message_id=rating["message_id"])
     except Exception:
+        logger.warning("Could not stop poll in chat %s", chat_id, exc_info=True)
 
-        logger.exception(
-            "❌ TEST TIMER MESSAGE FAILED"
-        )
+    finished = names_only(current_turn(state))
+    advance_turn(state)
 
-
-# ============================================================================
-# ACCEPT
-# ============================================================================
-
-async def accept_button_handler(
-    update,
-    context,
-):
-
-    query = (
-        update.callback_query
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{reason} Thanks {finished}! 🧹\n\n"
+            f"Moving on to the next turn.\n\n"
+            f"{build_whoseturn_text(state)}"
+        ),
+        reply_markup=accept_keyboard(),
     )
 
-    if not query:
-        return
-
-
-    clicker = query.from_user
-
-    state = load_state()
-
-    ensure_current_week(
-        state
-    )
-
-
-    people = current_turn(
-        state
-    )
-
-
-    if not is_person_in_turn(
-        clicker.id,
-        clicker.username,
-        people,
-    ):
-
-        await query.answer(
-            "This isn't your turn 😄",
-            show_alert=True,
-        )
-
-        return
-
-
-    await query.answer()
-
-
-    state["acknowledged"] = True
-
+    # Remember this message so the next reminder can replace it.
+    state["last_reminder_id"] = msg.message_id
     save_state(state)
 
 
+async def poll_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Called by Telegram whenever the vote count of one of our polls changes."""
+    poll = update.poll
+    state = load_state()
+    rating = state.get("rating")
+
+    if not rating or poll.id != rating["poll_id"]:
+        return
+
     logger.info(
-        "TURN ACCEPTED by %s (%s)",
-        clicker.first_name,
-        clicker.id,
+        "Rating progress: %s/%s votes", poll.total_voter_count, rating["needed"]
     )
 
+    if poll.total_voter_count >= rating["needed"]:
+        await complete_rating(context.bot, state, "Everyone has rated!")
+
+
+# ---------------------------------------------------------------------------
+# Callback handlers
+# ---------------------------------------------------------------------------
+
+
+async def accept_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    clicker = query.from_user
+    state = load_state()
+    people = current_turn(state)
+
+    if not is_person_in_turn(clicker.id, clicker.username, people):
+        await query.answer("This isn't your turn to accept 😄", show_alert=True)
+        return
+
+    await query.answer()
+    state["acknowledged"] = True
+    save_state(state)
 
     await query.edit_message_text(
-
-        text=(
-            f"✅ <b>{clicker.first_name}</b> "
-            "accepted the cleaning duty!\n\n"
-            "Congratulations. "
-            "The bot will shut the fuck up "
-            "until next Sunday. 🧹"
-        ),
-
-        parse_mode=ParseMode.HTML,
-
+        text=f"✅ {clicker.first_name} accepted the cleaning duty.\n\nTap below when the house is sparkling.",
         reply_markup=finish_keyboard(),
     )
 
 
-# ============================================================================
-# FINISH
-# ============================================================================
-
-async def finish_button_handler(
-    update,
-    context,
-):
-
-    query = (
-        update.callback_query
-    )
-
-    if not query:
-        return
-
-
+async def finish_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     clicker = query.from_user
-
     state = load_state()
+    people = current_turn(state)
 
-    ensure_current_week(
-        state
-    )
-
-
-    people = current_turn(
-        state
-    )
-
-
-    if not is_person_in_turn(
-        clicker.id,
-        clicker.username,
-        people,
-    ):
-
-        await query.answer(
-            "Only the person on duty can finish!",
-            show_alert=True,
-        )
-
+    if not is_person_in_turn(clicker.id, clicker.username, people):
+        await query.answer("Only the person on duty can finish it!", show_alert=True)
         return
 
-
-    await query.answer()
-
-
-    await query.edit_message_text(
-
-        text=(
-            f"🎉 <b>{clicker.first_name}</b> "
-            "finished the cleaning!\n\n"
-            "The house is apparently clean. "
-            "Miracles do happen. 🧹"
-        ),
-
-        parse_mode=ParseMode.HTML,
-    )
-
-
-    group_id = (
-        state.get("group_chat_id")
-        or query.message.chat_id
-    )
-
-
-    try:
-
-        await context.bot.send_poll(
-
-            chat_id=group_id,
-
-            question=(
-                f"How did {names_only(people)} "
-                "do this week?"
-            ),
-
-            options=POLL_OPTIONS,
-
-            is_anonymous=True,
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Could not send poll."
-        )
-
-
-    # IMPORTANT:
-    #
-    # DO NOT advance here.
-    #
-    # Sunday advances the rotation.
-
-    logger.info(
-        "Cleaning finished. "
-        "Rotation remains unchanged until Sunday."
-    )
-
-
-# ============================================================================
-# SCHEDULE BUTTON
-# ============================================================================
-
-async def schedule_button_handler(
-    update,
-    context,
-):
-
-    query = (
-        update.callback_query
-    )
-
-    if not query:
+    if state.get("rating"):
+        await query.answer("Already finished - waiting for everyone to rate.", show_alert=True)
         return
 
-
     await query.answer()
+    await query.edit_message_text(text=f"🎉 {clicker.first_name} finished the cleaning! Great job.")
 
+    group_id = state.get("group_chat_id") or query.message.chat_id
 
-    state = load_state()
+    # Everyone who is not on duty should rate.
+    needed = max(1, TOTAL_HOUSEMATES - len(people))
 
-    ensure_current_week(
-        state
+    poll_msg = await context.bot.send_poll(
+        chat_id=group_id,
+        question=f"How did {names_only(people)} do on their cleaning duty this week?",
+        options=POLL_OPTIONS,
+        is_anonymous=True,
     )
 
+    state["rating"] = {
+        "poll_id": poll_msg.poll.id,
+        "chat_id": group_id,
+        "message_id": poll_msg.message_id,
+        "needed": needed,
+        "started_at": datetime.now(TIMEZONE).isoformat(),
+    }
+    save_state(state)
 
     await context.bot.send_message(
-
-        chat_id=query.message.chat_id,
-
-        text=build_schedule_text(
-            state
+        chat_id=group_id,
+        text=(
+            f"Please rate above! As soon as {needed} people have voted, "
+            f"I'll move on to the next turn."
         ),
+    )
 
+
+async def schedule_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    state = load_state()
+
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=build_schedule_text(state),
         parse_mode=ParseMode.HTML,
     )
 
 
-# ============================================================================
-# REMINDER SENDING
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Reminder job
+# ---------------------------------------------------------------------------
 
-async def send_cleaning_reminder(
-    context,
-    slot,
-):
 
+async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Runs at every time in REMINDER_TIMES. Sends a nag unless the turn has
+    been accepted. While a rating poll is open it stays quiet (and closes the
+    poll if it has timed out)."""
     state = load_state()
-
-    ensure_current_week(
-        state
-    )
-
-
-    chat_id = state.get(
-        "group_chat_id"
-    )
-
+    chat_id = state.get("group_chat_id")
 
     if not chat_id:
-
-        logger.error(
-            "❌ Cannot send reminder: "
-            "group_chat_id is missing."
-        )
-
+        logger.warning("daily_reminder: no group_chat_id set - run /setgroup. Skipping.")
         return
 
+    # A rating poll is open: no nagging, but close it if it has timed out.
+    rating = state.get("rating")
+    if rating:
+        started = datetime.fromisoformat(rating["started_at"])
+        if datetime.now(TIMEZONE) - started > timedelta(hours=RATING_TIMEOUT_HOURS):
+            logger.info("daily_reminder: rating timed out - moving on.")
+            try:
+                await complete_rating(context.bot, state, "Voting time is over.")
+            except Exception:
+                logger.exception("daily_reminder: failed to complete rating")
+        else:
+            logger.info("daily_reminder: waiting for ratings - skipping.")
+        return
 
     if state["acknowledged"]:
-
-        logger.info(
-            "Reminder skipped: "
-            "turn already accepted."
-        )
-
+        logger.info("daily_reminder: turn already accepted - skipping nag.")
         return
 
+    people = current_turn(state)
+    text = reminder1_text(people) if state["nag_count"] == 0 else nag_text(people)
 
-    now = now_rome()
-
-    today_string = (
-        now.date().isoformat()
-    )
-
-
-    slot_key = (
-        f"{today_string}|{slot}"
-    )
-
-
-    # ------------------------------------------------------------
-    # DUPLICATE PROTECTION
-    # ------------------------------------------------------------
-
-    if slot_key in state.get(
-        "sent_slots",
-        [],
-    ):
-
-        logger.info(
-            "Reminder already sent for %s",
-            slot_key,
-        )
-
-        return
-
-
-    people = current_turn(
-        state
-    )
-
-
-    logger.info(
-        "================================================"
-    )
-
-    logger.info(
-        "🚨 SENDING CLEANING REMINDER"
-    )
-
-    logger.info(
-        "Rome time: %s",
-        now.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-    )
-
-    logger.info(
-        "Configured slot: %s",
-        slot,
-    )
-
-    logger.info(
-        "Current turn: %s",
-        names_only(people),
-    )
-
-    logger.info(
-        "Chat ID: %s",
-        chat_id,
-    )
-
+    # Delete the previous reminder so the chat doesn't fill up.
+    last_id = state.get("last_reminder_id")
+    if DELETE_OLD_REMINDERS and last_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=last_id)
+        except Exception:
+            pass  # already deleted, too old, or no permission - ignore
 
     try:
-
-        message = await context.bot.send_message(
-
+        msg = await context.bot.send_message(
             chat_id=chat_id,
-
-            text=reminder_text(
-                state
-            ),
-
+            text=text,
             parse_mode=ParseMode.HTML,
-
             reply_markup=accept_keyboard(),
         )
+        state["nag_count"] = state.get("nag_count", 0) + 1
+        state["last_reminder_id"] = msg.message_id
+        save_state(state)
+        logger.info("daily_reminder: sent nag #%s to chat %s", state["nag_count"], chat_id)
+    except Exception:
+        logger.exception("daily_reminder: failed to send message to chat %s", chat_id)
 
 
-        # Only mark as sent AFTER Telegram
-        # successfully accepts the message.
+# ---------------------------------------------------------------------------
+# Error handler
+# ---------------------------------------------------------------------------
 
-        state.setdefault(
-            "sent_slots",
-            []
-        ).append(
-            slot_key
-        )
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception", exc_info=context.error)
 
-        state["nag_count"] = (
-            state.get(
-                "nag_count",
-                0,
-            ) + 1
-        )
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-        # Keep state file small.
-        state["sent_slots"] = (
-            state["sent_slots"][-20:]
-        )
-
-
-        save_state(
-            state
-        )
-
-
-        logger.info(
-            "✅ REMINDER SENT!"
-        )
-
-        logger.info(
-            "Telegram message ID: %s",
-            message.message_id,
-        )
-
-        logger.info(
-            "Reminder count: %s",
-            state["nag_count"],
-        )
-
-        logger.info(
-            "================================================"
-        )
-
-
-    except Exception as exc:
-
-        logger.exception(
-            "❌ FAILED TO SEND REMINDER"
-        )
-
-        logger.error(
-            "Telegram error: %s",
-            exc,
-        )
-
-
-# ============================================================================
-# WATCHDOG
-# ============================================================================
-
-async def reminder_watchdog(
-    context,
-):
-
-    now = now_rome()
-
-    current_time = (
-        now.strftime("%H:%M")
-    )
-
-
-    logger.info(
-        "⏱️ Watchdog: Rome time = %s",
-        now.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-    )
-
-
-    # ------------------------------------------------------------
-    # UPDATE SUNDAY ROTATION
-    # ------------------------------------------------------------
-
-    state = load_state()
-
-    turn_changed = (
-        ensure_current_week(
-            state
-        )
-    )
-
-
-    if turn_changed:
-
-        logger.info(
-            "Sunday rotation applied."
-        )
-
-
-    # ------------------------------------------------------------
-    # CHECK REMINDER SLOT
-    # ------------------------------------------------------------
-
-    if current_time not in REMINDER_SLOTS:
-
-        return
-
-
-    logger.info(
-        "🎯 CURRENT TIME MATCHES REMINDER SLOT: %s",
-        current_time,
-    )
-
-
-    await send_cleaning_reminder(
-        context,
-        current_time,
-    )
-
-
-# ============================================================================
-# POST INIT
-# ============================================================================
-
-async def post_init(
-    application,
-):
-
-    logger.info(
-        "================================================"
-    )
-
-    logger.info(
-        "HOUSE CLEANING BOT STARTING"
-    )
-
-    logger.info(
-        "================================================"
-    )
-
-
-    # ------------------------------------------------------------
-    # Telegram commands
-    # ------------------------------------------------------------
-
-    await application.bot.set_my_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeDefault(),
-    )
-
-    await application.bot.set_my_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeAllPrivateChats(),
-    )
-
-    await application.bot.set_my_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeAllGroupChats(),
-    )
-
-
-    # ------------------------------------------------------------
-    # JobQueue check
-    # ------------------------------------------------------------
-
-    if application.job_queue is None:
-
-        raise RuntimeError(
-
-            "JobQueue is unavailable.\n\n"
-
-            'Run:\n'
-            'pip install -U '
-            '"python-telegram-bot[job-queue]"'
-        )
-
-
-    logger.info(
-        "✅ JobQueue available."
-    )
-
-
-    # ------------------------------------------------------------
-    # State
-    # ------------------------------------------------------------
-
-    state = load_state()
-
-    ensure_current_week(
-        state
-    )
-
-
-    logger.info(
-        "Group chat ID: %s",
-        state.get(
-            "group_chat_id"
-        ),
-    )
-
-    logger.info(
-        "Current turn: %s",
-        names_only(
-            current_turn(state)
-        ),
-    )
-
-    logger.info(
-        "Turn started: %s",
-        state.get(
-            "turn_start_date"
-        ),
-    )
-
-    logger.info(
-        "Accepted: %s",
-        state["acknowledged"],
-    )
-
-    logger.info(
-        "Nag count: %s",
-        state["nag_count"],
-    )
-
-
-    # ------------------------------------------------------------
-    # WATCHDOG
-    # ------------------------------------------------------------
-
-    application.job_queue.run_repeating(
-
-        reminder_watchdog,
-
-        interval=WATCHDOG_INTERVAL_SECONDS,
-
-        first=5,
-
-        name="cleaning_reminder_watchdog",
-    )
-
-
-    logger.info(
-        "================================================"
-    )
-
-    logger.info(
-        "WATCHDOG STARTED"
-    )
-
-    logger.info(
-        "Checks every %s seconds.",
-        WATCHDOG_INTERVAL_SECONDS,
-    )
-
-    logger.info(
-        "Reminder slots: %s",
-        sorted(
-            REMINDER_SLOTS
-        ),
-    )
-
-    logger.info(
-        "Timezone: Europe/Rome"
-    )
-
-    logger.info(
-        "================================================"
-    )
-
-
-    # ------------------------------------------------------------
-    # STARTUP MESSAGE
-    # ------------------------------------------------------------
-
-    chat_id = state.get(
-        "group_chat_id"
-    )
-
-
-    if chat_id:
-
-        try:
-
-            await application.bot.send_message(
-
-                chat_id=chat_id,
-
-                text=(
-
-                    "🧹😈 <b>MESSAGE SYSTEM ONLINE.</b>\n\n"
-
-                    "I'm gonna teach you how to be clean!\n\n"
-
-                    "The cleaning police are watching. 👀\n\n"
-
-                    "⏰ Reminder watchdog: ONLINE\n"
-                    "🇮🇹 Timezone: Europe/Rome\n"
-                    "🕘 09:00 / 15:00 / 21:00"
-
-                ),
-
-                parse_mode=ParseMode.HTML,
-            )
-
-
-            logger.info(
-                "✅ STARTUP MESSAGE SENT SUCCESSFULLY."
-            )
-
-
-        except Exception:
-
-            logger.exception(
-                "❌ STARTUP MESSAGE FAILED."
-            )
-
-    else:
-
-        logger.warning(
-            "⚠️ NO GROUP CHAT ID. "
-            "Run /setgroup."
-        )
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 def main():
+    if not TOKEN:
+        raise RuntimeError("HC_BOT_TOKEN environment variable is not set.")
 
-    logger.info(
-        "Creating Telegram application..."
-    )
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
+    if app.job_queue is None:
+        raise RuntimeError(
+            'JobQueue is missing. Install it with: pip install "python-telegram-bot[job-queue]"'
+        )
 
-    application = (
-
-        Application
-        .builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-
-    # ------------------------------------------------------------
     # Commands
-    # ------------------------------------------------------------
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("whoseturn", whoseturn_command))
+    app.add_handler(CommandHandler("schedule", schedule_command))
+    app.add_handler(CommandHandler("nextturn", nextturn_command))
+    app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CommandHandler("setgroup", setgroup_command))
+    app.add_handler(CommandHandler("testreminder", testreminder_command))
 
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(accept_button_handler, pattern=f"^{ACCEPT_CALLBACK}$"))
+    app.add_handler(CallbackQueryHandler(finish_button_handler, pattern=f"^{FINISH_CALLBACK}$"))
+    app.add_handler(CallbackQueryHandler(schedule_button_handler, pattern=f"^{SCHEDULE_CALLBACK}$"))
+
+    # Poll updates (vote counts) - used to auto-advance once everyone rated.
+    app.add_handler(PollHandler(poll_update_handler))
+
+    app.add_error_handler(on_error)
+
+    # Reminders: one job per time in REMINDER_TIMES, every day. Each job nags
+    # until someone accepts, stays quiet while ratings are pending.
+    for t in REMINDER_TIMES:
+        app.job_queue.run_daily(
+            daily_reminder,
+            time=t,
+            name=f"reminder_{t.hour:02d}{t.minute:02d}",
         )
-    )
 
-    application.add_handler(
-        CommandHandler(
-            "whoseturn",
-            whoseturn_command,
-        )
-    )
+    logger.info("House Cleaning Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    application.add_handler(
-        CommandHandler(
-            "schedule",
-            schedule_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "setgroup",
-            setgroup_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "testreminder",
-            testreminder_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "testtimer",
-            testtimer_command,
-        )
-    )
-
-
-    # ------------------------------------------------------------
-    # Owner commands
-    # ------------------------------------------------------------
-
-    application.add_handler(
-        CommandHandler(
-            "nextturn",
-            nextturn_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "restart",
-            restart_command,
-        )
-    )
-
-
-    # ------------------------------------------------------------
-    # Buttons
-    # ------------------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            accept_button_handler,
-            pattern=(
-                f"^{ACCEPT_CALLBACK}$"
-            ),
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            finish_button_handler,
-            pattern=(
-                f"^{FINISH_CALLBACK}$"
-            ),
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            schedule_button_handler,
-            pattern=(
-                f"^{SCHEDULE_CALLBACK}$"
-            ),
-        )
-    )
-
-
-    # ------------------------------------------------------------
-    # START
-    # ------------------------------------------------------------
-
-    logger.info(
-        "Starting Telegram polling..."
-    )
-
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
 
 if __name__ == "__main__":
-
     main()
